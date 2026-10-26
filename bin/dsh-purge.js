@@ -1,28 +1,23 @@
 #!/usr/bin/env node
-// dsh-purge CLI（小杨）— 移植自 dsh_purge.py 的静默模式，功能一个不差
-// 用法:
-//   dsh-purge              # TUI 等价：默认只显示状态（这里同 --status）
-//   dsh-purge --status     # 显示状态
-//   dsh-purge --apply      # 应用全部清洗
-//   dsh-purge --revert     # 回滚还原
-//   dsh-purge --edit       # 编辑 prompt-inject.md
-//   dsh-purge --help       # 帮助
 
 import * as core from "../lib/core.js";
+import * as rules from "../lib/rules.js";
 
 const args = process.argv.slice(2);
 
 function printStatus(state) {
   const out = [];
   out.push("dsh-purge 状态 / Status");
+  out.push("  宿主 / surface " + (state.surface || "web"));
   out.push("  DSH_HOME      " + state.dsh_home);
+  if (state.desktop_install) out.push("  桌面安装       " + state.desktop_install);
   if (state.ai_base) {
     out.push("  插件根 / root  " + state.ai_base);
     for (const [key, fp] of Object.entries(state.files)) {
       out.push(`    ${key.padEnd(22)} ${fp}`);
     }
   } else {
-    out.push("  插件根 / root  NOT FOUND (set DSH_BASE)");
+    out.push("  插件根 / root  " + core.missingAiBaseMessage());
   }
   out.push(`  shim 目录      ${state.shim_dir || "未定位 / not found"}`);
   out.push(`  备份 / backup  ${state.has_backup ? "有 / yes" : "无 / no"}`);
@@ -41,13 +36,14 @@ function printStatus(state) {
 }
 
 async function main() {
-  const mode = args.find((a) => ["--apply", "--revert", "--status", "--edit", "--help"].includes(a));
+  const mode = args.find((a) => ["--apply", "--revert", "--uninstall", "--status", "--edit", "--help"].includes(a));
 
   if (mode === "--help" || args.includes("-h")) {
     console.log(`dsh-purge 用法:
   dsh-purge --status     显示状态
   dsh-purge --apply      应用全部清洗（提示词+代码+shim+override）
   dsh-purge --revert     回滚还原
+  dsh-purge --uninstall  卸载插件（已应用则先还原）
   dsh-purge --edit       编辑注入文件 prompt-inject.md
   dsh-purge --help       帮助`);
     return;
@@ -59,22 +55,33 @@ async function main() {
 
   if (mode === "--apply") {
     if (!state.ai_base) {
-      console.log("[ERROR] 未找到 @deepseek-ai 插件根");
-      console.log("  fix: 设置 DSH_BASE=完整路径");
+      console.log("[ERROR] " + core.missingAiBaseMessage());
+      console.log("  fix: 把 DSH_BASE 指到含 dsh-agent-instructions/lib 的 @deepseek-ai 目录");
       process.exit(1);
     }
-    const { made, errors } = await core.backupAll(state.ai_base);
-    for (const b of made) console.log(`  ✓ 备份 / backup → ${b}`);
-    for (const [p, e] of errors) console.log(`  ⚠ 备份失败 ${p}: ${e}`);
-    const report = await core.applyPatches(state.ai_base);
+    const inject = rules.resolveInjectText(state.dsh_home);
+    if (!inject.text) {
+      console.log("[ERROR] 提示词和规则集都是空的，必须先添加提示词");
+      process.exit(1);
+    }
+    const { hosts, report } = await core.applyPatchesAllHosts(core.ALL_PATCHES, {
+      preserveClientBundles: false,
+      forApply: true,
+    });
+    for (const h of hosts) console.log(`  宿主 / host → ${h.aiBase}`);
     for (const r of report) {
       const m = r.status === "applied" ? "✓ 已清洗" : r.status === "already" ? "- 已是最新" : r.status === "missing_file" ? "⚠ 文件缺失" : `✗ ${r.status}`;
       console.log(`  ${m} patch #${String(r.patch_id).padEnd(2)} ${r.name}`);
     }
-    const flash = core.silenceCmdFlash(state.ai_base);
+    const flashHost = hosts[0]?.aiBase || state.ai_base;
+    const flash = core.silenceCmdFlash(flashHost);
     console.log(`  cmd-flash=${flash.entry} phase-1=${flash.phase1} ok=${flash.ok}`);
-    const ov = await core.installOverride(state.dsh_home, false);
-    console.log(ov === "wrote" ? `  ✓ 写入 ${state.override_path}` : "  - prompt-inject.md 已存在 (你的自定义内容将保留)");
+    if (hosts.length > 1) {
+      console.log(`  多宿主 / multi-host: ${hosts.length} 份 @deepseek-ai 已清洗`);
+    }
+    console.log(inject.source === "rule"
+      ? "  - 使用当前规则集，不改写提示词文件"
+      : "  - 使用已有提示词文件");
     if (state.shim_dir) {
       const r = await core.patchShim(state.shim_dir);
       for (const [fname, st] of Object.entries(r)) {
@@ -89,8 +96,8 @@ async function main() {
     console.log("");
     console.log("全部完成 / All done。重启 dsh 生效 / Restart dsh to take effect.");
   } else if (mode === "--revert") {
-    if (state.ai_base) {
-      const { reverted, errors } = await core.revertAll(state.ai_base);
+    if (state.ai_base || core.enumeratePatchAiBases().length) {
+      const { reverted, errors } = await core.revertAllHosts();
       for (const p of reverted) console.log(`  ✓ 已还原 / Reverted ${p}`);
       for (const [p, e] of errors) console.log(`  ⚠ 还原失败 ${p}: ${e}`);
       if (reverted.length === 0) console.log("  - 没有补丁备份可还原 / no patch backup");
@@ -105,6 +112,20 @@ async function main() {
     console.log("");
     console.log("回滚完成 / Revert done。重启 dsh 后恢复 / restart to restore.");
     console.log("注: prompt-inject.md 保留（用户文件）/ prompt-inject.md kept (user file)");
+  } else if (mode === "--uninstall") {
+    const { uninstallPurge } = await import("../lib/uninstall.js");
+    const result = await uninstallPurge();
+    if (result.applied) console.log("  已检测到补丁，已还原回原版。");
+    else console.log("  未检测到已应用补丁，仍会清除插件文件。");
+    if (result.override?.removed) console.log(`  已删除 ${result.override.path}`);
+    if (result.stripped?.length) console.log(`  已从 profile 移除: ${result.stripped.join(", ")}`);
+    for (const e of result.errors || []) console.log(`  ⚠ ${e}`);
+    if (!result.ok) {
+      console.log("  卸载中止：还原失败，插件文件未删除。");
+      process.exit(1);
+    }
+    console.log("");
+    console.log("卸载完成。请重启 dsh。");
   } else if (mode === "--edit") {
     const r = core.editOverride(state.dsh_home);
     if (!r.ok && r.needCreate) {
@@ -116,7 +137,6 @@ async function main() {
     }
     console.log("  编辑完成后重启 dsh 生效。");
   } else {
-    // 默认只显示状态（对齐 py 的"默认不清洗"）
     console.log("默认不清洗，使用 --apply 应用清洗。");
   }
 }
